@@ -1,8 +1,10 @@
 import os
 import tempfile
+import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import Mock, call, patch
 
 import prompt_refiner
 
@@ -60,6 +62,87 @@ class PromptRefinerStorageTests(unittest.TestCase):
             recap_text = recap_path.read_text(encoding="utf-8")
             self.assertIn("recent.md", recap_text)
             self.assertNotIn("old.md", recap_text)
+
+
+class PromptRefinerUnitTests(unittest.TestCase):
+    def test_refine_prompt_validates_input_and_api_key(self) -> None:
+        with self.assertRaises(ValueError):
+            prompt_refiner.refine_prompt("", api_key="k")
+        with self.assertRaises(ValueError):
+            prompt_refiner.refine_prompt("hi", api_key="")
+
+    def test_refine_prompt_uses_generative_model_api(self) -> None:
+        fake_response = types.SimpleNamespace(text="Refined output")
+        fake_model = Mock()
+        fake_model.generate_content.return_value = fake_response
+        fake_genai = types.SimpleNamespace(
+            configure=Mock(),
+            GenerativeModel=Mock(return_value=fake_model),
+        )
+        fake_google = types.SimpleNamespace(generativeai=fake_genai)
+        with patch.dict("sys.modules", {"google": fake_google, "google.generativeai": fake_genai}):
+            refined = prompt_refiner.refine_prompt("messy input", api_key="abc")
+
+        self.assertEqual(refined, "Refined output")
+        fake_genai.configure.assert_called_once_with(api_key="abc")
+        fake_genai.GenerativeModel.assert_called_once_with("gemini-1.5-flash")
+        fake_model.generate_content.assert_called_once()
+
+    def test_copy_to_clipboard_calls_pyperclip(self) -> None:
+        fake_pyperclip = types.SimpleNamespace(copy=Mock())
+        with patch.dict("sys.modules", {"pyperclip": fake_pyperclip}):
+            prompt_refiner.copy_to_clipboard("hello")
+        fake_pyperclip.copy.assert_called_once_with("hello")
+
+    def test_paste_with_xdotool_runs_expected_commands(self) -> None:
+        with patch("prompt_refiner.subprocess.run") as run:
+            prompt_refiner.paste_with_xdotool("hello", "Claude")
+
+        self.assertEqual(run.call_count, 3)
+        run.assert_has_calls(
+            [
+                call(
+                    ["xdotool", "search", "--name", "Claude", "windowactivate", "--sync"],
+                    check=True,
+                    stdout=prompt_refiner.subprocess.PIPE,
+                    stderr=prompt_refiner.subprocess.PIPE,
+                    text=True,
+                ),
+                call(["xdotool", "type", "--delay", "1", "hello"], check=True),
+                call(["xdotool", "key", "Return"], check=True),
+            ]
+        )
+
+    def test_paste_with_xdotool_rejects_null_characters(self) -> None:
+        with patch("prompt_refiner.subprocess.run") as run:
+            with self.assertRaises(ValueError):
+                prompt_refiner.paste_with_xdotool("bad\x00text", "Claude")
+        run.assert_not_called()
+
+    def test_process_input_falls_back_to_selenium_when_xdotool_fails(self) -> None:
+        with patch("prompt_refiner.refine_prompt", return_value="refined"), patch(
+            "prompt_refiner.copy_to_clipboard"
+        ), patch(
+            "prompt_refiner.save_refined_prompt", return_value=Path("/tmp/test-note.md")
+        ), patch(
+            "prompt_refiner.paste_with_xdotool", side_effect=FileNotFoundError("xdotool missing")
+        ), patch(
+            "prompt_refiner.paste_with_selenium"
+        ) as selenium_fallback:
+            prompt_refiner._process_input(  # noqa: SLF001
+                "messy",
+                api_key="abc",
+                model_name="gemini-1.5-flash",
+                vault_path="/tmp/vault",
+                tags=[],
+                no_clipboard=False,
+                auto_paste=True,
+                window_name="Claude",
+                selenium_url="https://chatgpt.com",
+                selenium_browser="firefox",
+            )
+
+        selenium_fallback.assert_called_once_with("refined", "https://chatgpt.com", browser="firefox")
 
 
 if __name__ == "__main__":

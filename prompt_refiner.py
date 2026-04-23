@@ -51,7 +51,14 @@ def copy_to_clipboard(text: str) -> None:
     pyperclip.copy(text)
 
 
+def _sanitize_for_xdotool(text: str) -> str:
+    if "\x00" in text:
+        raise ValueError("Refined prompt contains unsupported null characters.")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def paste_with_xdotool(text: str, window_name: str) -> None:
+    safe_text = _sanitize_for_xdotool(text)
     subprocess.run(
         ["xdotool", "search", "--name", window_name, "windowactivate", "--sync"],
         check=True,
@@ -59,19 +66,28 @@ def paste_with_xdotool(text: str, window_name: str) -> None:
         stderr=subprocess.PIPE,
         text=True,
     )
-    subprocess.run(["xdotool", "type", "--delay", "1", text], check=True)
+    subprocess.run(["xdotool", "type", "--delay", "1", safe_text], check=True)
     subprocess.run(["xdotool", "key", "Return"], check=True)
 
 
-def paste_with_selenium(text: str, url: str) -> None:
+def paste_with_selenium(text: str, url: str, browser: str = "firefox") -> None:
     from selenium import webdriver
+    from selenium.common.exceptions import NoSuchElementException
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
 
-    driver = webdriver.Firefox()
+    if browser.lower() == "chrome":
+        driver = webdriver.Chrome()
+    else:
+        driver = webdriver.Firefox()
     try:
         driver.get(url)
-        editor = driver.find_element(By.CSS_SELECTOR, "[contenteditable='true']")
+        try:
+            editor = driver.find_element(By.CSS_SELECTOR, "[contenteditable='true']")
+        except NoSuchElementException as exc:
+            raise RuntimeError(
+                "Could not find a rich text input field ([contenteditable='true']) on the page."
+            ) from exc
         editor.click()
         editor.send_keys(text)
         editor.send_keys(Keys.ENTER)
@@ -103,7 +119,9 @@ def save_refined_prompt(
     with note_path.open("w", encoding="utf-8") as handle:
         handle.write("---\n")
         handle.write(f"created: {now.isoformat()}\n")
-        handle.write(f"tags: [{', '.join(merged_tags)}]\n")
+        handle.write("tags:\n")
+        for tag in merged_tags:
+            handle.write(f"  - {tag}\n")
         handle.write("---\n\n")
         handle.write("# Refined Prompt\n\n")
         handle.write("## Original Input\n")
@@ -117,7 +135,7 @@ def save_refined_prompt(
     timeline = vault / "AI Prompts" / "_timeline.md"
     timeline.parent.mkdir(parents=True, exist_ok=True)
     with timeline.open("a", encoding="utf-8") as handle:
-        handle.write(f"- {now.strftime('%Y-%m-%d %H:%M:%S %Z')} - [[{note_path.stem}]]\n")
+        handle.write(f"- {now.strftime('%Y-%m-%d %H:%M:%S')} UTC - [[{note_path.stem}]]\n")
 
     return note_path
 
@@ -163,6 +181,7 @@ def _process_input(
     auto_paste: bool,
     window_name: str,
     selenium_url: str | None,
+    selenium_browser: str,
 ) -> None:
     refined = refine_prompt(messy_input, api_key=api_key, model_name=model_name)
     print("\nRefined Prompt:\n")
@@ -179,10 +198,10 @@ def _process_input(
         try:
             paste_with_xdotool(refined, window_name)
             print("[Auto-pasted with xdotool]")
-        except Exception as exc:  # noqa: BLE001
+        except (FileNotFoundError, subprocess.CalledProcessError, ValueError) as exc:
             if selenium_url:
                 print(f"[xdotool failed: {exc}. Falling back to Selenium]")
-                paste_with_selenium(refined, selenium_url)
+                paste_with_selenium(refined, selenium_url, browser=selenium_browser)
                 print("[Auto-pasted with Selenium fallback]")
             else:
                 raise
@@ -201,8 +220,18 @@ def _parse_args() -> argparse.Namespace:
     refine_parser.add_argument("--tags", default="", help="Comma-separated extra tags.")
     refine_parser.add_argument("--no-clipboard", action="store_true", help="Skip clipboard copy.")
     refine_parser.add_argument("--auto-paste", action="store_true", help="Paste into browser input with xdotool.")
-    refine_parser.add_argument("--window-name", default="Claude|ChatGPT", help="xdotool window name pattern.")
+    refine_parser.add_argument(
+        "--window-name",
+        default="Claude|ChatGPT",
+        help="xdotool window title pattern (regex-style, e.g. 'Claude|ChatGPT').",
+    )
     refine_parser.add_argument("--selenium-url", help="Optional fallback URL for Selenium paste.")
+    refine_parser.add_argument(
+        "--selenium-browser",
+        default="firefox",
+        choices=("firefox", "chrome"),
+        help="Browser for Selenium fallback (default: firefox).",
+    )
 
     recap_parser = subparsers.add_parser("weekly-recap", help="Generate weekly Obsidian recap.")
     recap_parser.add_argument("--vault-path", default=os.getenv("OBSIDIAN_VAULT_PATH"), help="Obsidian vault path.")
@@ -246,6 +275,7 @@ def main() -> int:
                 auto_paste=args.auto_paste,
                 window_name=args.window_name,
                 selenium_url=args.selenium_url,
+                selenium_browser=args.selenium_browser,
             )
         return 0
 
@@ -265,6 +295,7 @@ def main() -> int:
         auto_paste=args.auto_paste,
         window_name=args.window_name,
         selenium_url=args.selenium_url,
+        selenium_browser=args.selenium_browser,
     )
     return 0
 

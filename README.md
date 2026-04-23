@@ -78,7 +78,7 @@ Run weekly recap automatically with cron:
 ```bash
 crontab -e
 # Every Sunday at 01:00
-0 1 * * 0 cd /home/runner/work/hades/hades && /usr/bin/python3 prompt_refiner.py weekly-recap
+0 1 * * 0 cd /path/to/hades && /usr/bin/python3 prompt_refiner.py weekly-recap
 ```
 
 This gives you:
