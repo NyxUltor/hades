@@ -67,8 +67,10 @@ class PromptRefinerStorageTests(unittest.TestCase):
 
 class PromptRefinerUnitTests(unittest.TestCase):
     def test_parse_args_uses_obsidian_path_and_api_key_defaults(self) -> None:
-        with patch.object(prompt_refiner, "OBSIDIAN_PATH", "/tmp/vault"), patch.object(
-            prompt_refiner, "GEMINI_API_KEY", "abc"
+        with patch.dict(
+            os.environ,
+            {"OBSIDIAN_PATH": "/tmp/vault", "GEMINI_API_KEY": "abc", "OBSIDIAN_VAULT_PATH": ""},
+            clear=False,
         ), patch.object(sys, "argv", ["prompt_refiner.py", "refine", "--input", "messy"]):
             args = prompt_refiner._parse_args()  # noqa: SLF001
 
@@ -76,8 +78,10 @@ class PromptRefinerUnitTests(unittest.TestCase):
         self.assertEqual(args.api_key, "abc")
 
     def test_parse_args_keeps_legacy_obsidian_vault_path_fallback(self) -> None:
-        with patch.object(prompt_refiner, "OBSIDIAN_PATH", None), patch.dict(
-            os.environ, {"OBSIDIAN_VAULT_PATH": "/tmp/legacy-vault"}, clear=False
+        with patch.dict(
+            os.environ,
+            {"OBSIDIAN_PATH": "", "OBSIDIAN_VAULT_PATH": "/tmp/legacy-vault"},
+            clear=False,
         ), patch.object(sys, "argv", ["prompt_refiner.py", "weekly-recap"]):
             args = prompt_refiner._parse_args()  # noqa: SLF001
 
