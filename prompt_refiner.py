@@ -54,9 +54,9 @@ def refine_prompt(messy_input: str, api_key: str) -> str:
     response = client.models.generate_content(
         model=model_name,
         contents=(
-        "Restructure this into a clean, concise, structured prompt for a smart AI. "
-        "Minimize tokens without losing intent. Use short sections and bullet points when useful.\n\n"
-        f"{messy_input.strip()}"
+            "Restructure this into a clean, concise, structured prompt for a smart AI. "
+            "Minimize tokens without losing intent. Use short sections and bullet points when useful.\n\n"
+            f"{messy_input.strip()}"
         ),
     )
     text = (getattr(response, "text", "") or "").strip()
