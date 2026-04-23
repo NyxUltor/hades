@@ -9,8 +9,17 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
+from dotenv import load_dotenv
+
 DEFAULT_MODEL = "gemini-1.5-flash"
 DEFAULT_TAGS = ("ai", "prompt", "hades")
+
+
+def _load_env_config() -> tuple[str | None, str | None]:
+    load_dotenv()
+    obsidian_path = os.getenv("OBSIDIAN_PATH") or os.getenv("OBSIDIAN_VAULT_PATH")
+    gemini_api_key = os.getenv("GEMINI_API_KEY")
+    return obsidian_path, gemini_api_key
 
 
 def _utc_now() -> datetime:
@@ -208,14 +217,20 @@ def _process_input(
 
 
 def _parse_args() -> argparse.Namespace:
+    obsidian_path, gemini_api_key = _load_env_config()
+
     parser = argparse.ArgumentParser(description="Hades prompt refiner and Obsidian updater.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     refine_parser = subparsers.add_parser("refine", help="Refine input and save to Obsidian.")
     refine_parser.add_argument("--input", dest="input_text", help="Messy text to refine.")
     refine_parser.add_argument("--continuous", action="store_true", help="Keep refining new input until exit.")
-    refine_parser.add_argument("--vault-path", default=os.getenv("OBSIDIAN_VAULT_PATH"), help="Obsidian vault path.")
-    refine_parser.add_argument("--api-key", default=os.getenv("GEMINI_API_KEY"), help="Gemini API key.")
+    refine_parser.add_argument(
+        "--vault-path",
+        default=obsidian_path,
+        help="Obsidian vault path.",
+    )
+    refine_parser.add_argument("--api-key", default=gemini_api_key, help="Gemini API key.")
     refine_parser.add_argument("--model", default=DEFAULT_MODEL, help="Gemini model name.")
     refine_parser.add_argument("--tags", default="", help="Comma-separated extra tags.")
     refine_parser.add_argument("--no-clipboard", action="store_true", help="Skip clipboard copy.")
@@ -234,7 +249,11 @@ def _parse_args() -> argparse.Namespace:
     )
 
     recap_parser = subparsers.add_parser("weekly-recap", help="Generate weekly Obsidian recap.")
-    recap_parser.add_argument("--vault-path", default=os.getenv("OBSIDIAN_VAULT_PATH"), help="Obsidian vault path.")
+    recap_parser.add_argument(
+        "--vault-path",
+        default=obsidian_path,
+        help="Obsidian vault path.",
+    )
 
     return parser.parse_args()
 
@@ -243,7 +262,7 @@ def main() -> int:
     args = _parse_args()
 
     if not args.vault_path:
-        print("Error: --vault-path or OBSIDIAN_VAULT_PATH is required.", file=sys.stderr)
+        print("Error: --vault-path or OBSIDIAN_PATH is required.", file=sys.stderr)
         return 2
 
     if args.command == "weekly-recap":
