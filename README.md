@@ -32,12 +32,21 @@ sudo apt-get install xdotool
 
 ## Configuration
 
-Set environment variables:
+Create a `.env` file in the project root:
 
 ```bash
-export GEMINI_API_KEY="your-key"
-export OBSIDIAN_VAULT_PATH="/absolute/path/to/your/ObsidianVault"
+cp .env.example .env
 ```
+
+Then set:
+
+```bash
+OBSIDIAN_PATH=/absolute/path/to/your/ObsidianVault
+GEMINI_API_KEY=your-key
+```
+
+`prompt_refiner.py` loads these values via `python-dotenv` automatically.  
+(`OBSIDIAN_VAULT_PATH` is still accepted as a fallback for compatibility.)
 
 ## Usage
 
