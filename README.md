@@ -4,7 +4,8 @@ Hades is a lightweight AI prompt refiner + Obsidian knowledge pipeline.
 
 ## Features
 
-- Refines messy input with Gemini **`gemini-1.5-flash`** using the correct `GenerativeModel` API usage.
+- Refines messy input with Gemini via the modern **`google.genai`** client API.
+- Selects a compatible generation model automatically at runtime.
 - Copies refined output to clipboard automatically.
 - Optionally pastes into Claude/ChatGPT browser windows using **xdotool** (Linux-first).
 - Optional Selenium fallback for browser automation.

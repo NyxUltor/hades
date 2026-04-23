@@ -11,7 +11,6 @@ from typing import Iterable
 
 from dotenv import load_dotenv
 
-DEFAULT_MODEL = "gemini-1.5-flash"
 DEFAULT_TAGS = ("ai", "prompt", "hades")
 
 
@@ -33,20 +32,32 @@ def _slugify(value: str, max_length: int = 64) -> str:
     return slug[:max_length].rstrip("-")
 
 
-def refine_prompt(messy_input: str, api_key: str, model_name: str = DEFAULT_MODEL) -> str:
+def _select_generation_model(client: object) -> str:
+    for model in client.models.list():
+        model_name = (getattr(model, "name", "") or "").strip()
+        supported_actions = getattr(model, "supported_actions", ()) or ()
+        if model_name and "generateContent" in supported_actions:
+            return model_name
+    raise RuntimeError("No Gemini model with generateContent support is available for this API key.")
+
+
+def refine_prompt(messy_input: str, api_key: str) -> str:
     if not messy_input.strip():
         raise ValueError("Input cannot be empty.")
     if not api_key:
         raise ValueError("Gemini API key is required.")
 
-    import google.generativeai as genai
+    from google import genai
 
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
-    response = model.generate_content(
-        "Restructure this into a clean, concise, structured prompt for a smart AI. "
-        "Minimize tokens without losing intent. Use short sections and bullet points when useful.\n\n"
-        f"{messy_input.strip()}"
+    client = genai.Client(api_key=api_key)
+    model_name = _select_generation_model(client)
+    response = client.models.generate_content(
+        model=model_name,
+        contents=(
+            "Restructure this into a clean, concise, structured prompt for a smart AI. "
+            "Minimize tokens without losing intent. Use short sections and bullet points when useful.\n\n"
+            f"{messy_input.strip()}"
+        ),
     )
     text = (getattr(response, "text", "") or "").strip()
     if not text:
@@ -183,7 +194,6 @@ def generate_weekly_recap(vault_path: str, now: datetime | None = None) -> tuple
 def _process_input(
     messy_input: str,
     api_key: str,
-    model_name: str,
     vault_path: str,
     tags: Iterable[str],
     no_clipboard: bool,
@@ -192,7 +202,7 @@ def _process_input(
     selenium_url: str | None,
     selenium_browser: str,
 ) -> None:
-    refined = refine_prompt(messy_input, api_key=api_key, model_name=model_name)
+    refined = refine_prompt(messy_input, api_key=api_key)
     print("\nRefined Prompt:\n")
     print(refined)
 
@@ -231,7 +241,6 @@ def _parse_args() -> argparse.Namespace:
         help="Obsidian vault path.",
     )
     refine_parser.add_argument("--api-key", default=gemini_api_key, help="Gemini API key.")
-    refine_parser.add_argument("--model", default=DEFAULT_MODEL, help="Gemini model name.")
     refine_parser.add_argument("--tags", default="", help="Comma-separated extra tags.")
     refine_parser.add_argument("--no-clipboard", action="store_true", help="Skip clipboard copy.")
     refine_parser.add_argument("--auto-paste", action="store_true", help="Paste into browser input with xdotool.")
@@ -287,7 +296,6 @@ def main() -> int:
             _process_input(
                 messy,
                 api_key=args.api_key,
-                model_name=args.model,
                 vault_path=args.vault_path,
                 tags=tags,
                 no_clipboard=args.no_clipboard,
@@ -307,7 +315,6 @@ def main() -> int:
     _process_input(
         input_text,
         api_key=args.api_key,
-        model_name=args.model,
         vault_path=args.vault_path,
         tags=tags,
         no_clipboard=args.no_clipboard,

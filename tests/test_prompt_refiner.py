@@ -93,22 +93,36 @@ class PromptRefinerUnitTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             prompt_refiner.refine_prompt("hi", api_key="")
 
-    def test_refine_prompt_uses_generative_model_api(self) -> None:
+    def test_refine_prompt_uses_genai_client_with_auto_model_selection(self) -> None:
         fake_response = types.SimpleNamespace(text="Refined output")
-        fake_model = Mock()
-        fake_model.generate_content.return_value = fake_response
+        fake_client = Mock()
+        fake_client.models.list.return_value = [
+            types.SimpleNamespace(name="models/gemini-2.5-flash", supported_actions=["generateContent"])
+        ]
+        fake_client.models.generate_content.return_value = fake_response
         fake_genai = types.SimpleNamespace(
-            configure=Mock(),
-            GenerativeModel=Mock(return_value=fake_model),
+            Client=Mock(return_value=fake_client),
         )
-        fake_google = types.SimpleNamespace(generativeai=fake_genai)
-        with patch.dict("sys.modules", {"google": fake_google, "google.generativeai": fake_genai}):
+        fake_google = types.SimpleNamespace(genai=fake_genai)
+        with patch.dict("sys.modules", {"google": fake_google, "google.genai": fake_genai}):
             refined = prompt_refiner.refine_prompt("messy input", api_key="abc")
 
         self.assertEqual(refined, "Refined output")
-        fake_genai.configure.assert_called_once_with(api_key="abc")
-        fake_genai.GenerativeModel.assert_called_once_with("gemini-1.5-flash")
-        fake_model.generate_content.assert_called_once()
+        fake_genai.Client.assert_called_once_with(api_key="abc")
+        fake_client.models.list.assert_called_once_with()
+        fake_client.models.generate_content.assert_called_once()
+        self.assertEqual(fake_client.models.generate_content.call_args.kwargs["model"], "models/gemini-2.5-flash")
+
+    def test_refine_prompt_raises_when_no_supported_model_is_available(self) -> None:
+        fake_client = Mock()
+        fake_client.models.list.return_value = [types.SimpleNamespace(name="models/embedding-001", supported_actions=[])]
+        fake_genai = types.SimpleNamespace(
+            Client=Mock(return_value=fake_client),
+        )
+        fake_google = types.SimpleNamespace(genai=fake_genai)
+        with patch.dict("sys.modules", {"google": fake_google, "google.genai": fake_genai}):
+            with self.assertRaises(RuntimeError):
+                prompt_refiner.refine_prompt("messy input", api_key="abc")
 
     def test_copy_to_clipboard_calls_pyperclip(self) -> None:
         fake_pyperclip = types.SimpleNamespace(copy=Mock())
@@ -154,7 +168,6 @@ class PromptRefinerUnitTests(unittest.TestCase):
             prompt_refiner._process_input(  # noqa: SLF001
                 "messy",
                 api_key="abc",
-                model_name="gemini-1.5-flash",
                 vault_path="/tmp/vault",
                 tags=[],
                 no_clipboard=False,
