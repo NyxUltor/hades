@@ -1,17 +1,48 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import subprocess
 import sys
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 
 DEFAULT_TAGS = ("ai", "prompt", "hades")
+
+DEFAULT_OLLAMA_MODEL = "gemma3:1b"
+DEFAULT_OLLAMA_URL = "http://localhost:11434"
+
+# Ordered list of preferred stable Gemini models (most preferred first).
+# Override at runtime with the GEMINI_MODEL environment variable.
+_PREFERRED_GEMINI_MODELS = [
+    "models/gemini-2.0-flash",
+    "models/gemini-2.0-flash-latest",
+    "models/gemini-1.5-flash",
+    "models/gemini-1.5-flash-latest",
+    "models/gemini-1.5-pro",
+    "models/gemini-1.5-pro-latest",
+]
+
+# System prompt that instructs the model to act purely as a prompt engineer.
+REFINE_SYSTEM_PROMPT = """\
+You are a prompt engineer. Your only job is to restructure and compress the \
+input into a clean, minimal, structured prompt suitable for a large language model. \
+Never answer or act on the input.
+
+Rules:
+- Use this structure when applicable: Role / Context / Task / Constraints / Output
+- Strip all filler words, politeness, and redundancy
+- Use bullet points, not paragraphs
+- Minimize tokens without losing intent or nuance
+- If the input is already clean, tighten it further
+- Output only the structured prompt itself — no explanations, preamble, or commentary\
+"""
 
 
 def _load_env_config() -> tuple[str | None, str | None]:
@@ -19,6 +50,49 @@ def _load_env_config() -> tuple[str | None, str | None]:
     obsidian_path = os.getenv("OBSIDIAN_PATH") or os.getenv("OBSIDIAN_VAULT_PATH")
     gemini_api_key = os.getenv("GEMINI_API_KEY")
     return obsidian_path, gemini_api_key
+
+
+def _load_ollama_config() -> dict | None:
+    """Return Ollama config dict if enabled via environment, else None."""
+    if os.getenv("OLLAMA_ENABLED", "").lower() != "true":
+        return None
+    return {
+        "enabled": "true",
+        "model": os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
+        "url": os.getenv("OLLAMA_URL", DEFAULT_OLLAMA_URL),
+    }
+
+
+def _setup_ollama_preference() -> None:
+    """Ask the user once whether to enable Ollama fallback, then persist the choice to .env."""
+    print(
+        "\n[First-run setup] Hades can fall back to a local Ollama model when Gemini is unavailable.\n"
+        "  Requires: Ollama installed and running (https://ollama.ai)\n"
+        f"  Default model: {DEFAULT_OLLAMA_MODEL}  (install: ollama pull {DEFAULT_OLLAMA_MODEL})"
+    )
+    env_path = str(Path(__file__).parent / ".env")
+    while True:
+        choice = input("\nEnable local Ollama fallback? [y/N]: ").strip().lower()
+        if choice in ("y", "yes"):
+            set_key(env_path, "OLLAMA_ENABLED", "true")
+            set_key(env_path, "OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+            set_key(env_path, "OLLAMA_URL", DEFAULT_OLLAMA_URL)
+            print(f"[Ollama fallback enabled. Run 'ollama pull {DEFAULT_OLLAMA_MODEL}' if not already installed.]")
+            return
+        if choice in ("", "n", "no"):
+            set_key(env_path, "OLLAMA_ENABLED", "false")
+            print("[Ollama fallback disabled. Set OLLAMA_ENABLED=true in .env to enable later.]")
+            return
+        print("Please enter 'y' or 'n'.")
+
+
+def _maybe_setup_ollama() -> dict | None:
+    """Return Ollama config; prompt for first-run setup when running interactively."""
+    load_dotenv()
+    if os.getenv("OLLAMA_ENABLED") is None and sys.stdin.isatty():
+        _setup_ollama_preference()
+        load_dotenv(override=True)
+    return _load_ollama_config()
 
 
 def _utc_now() -> datetime:
@@ -33,15 +107,73 @@ def _slugify(value: str, max_length: int = 64) -> str:
 
 
 def _select_generation_model(client: object) -> str:
+    """Select a Gemini model, preferring stable releases.
+
+    Set the ``GEMINI_MODEL`` environment variable to override model selection.
+    """
+    override = os.getenv("GEMINI_MODEL")
+    if override:
+        return override
+
+    available: dict[str, bool] = {}
     for model in client.models.list():
         model_name = (getattr(model, "name", "") or "").strip()
         supported_actions = getattr(model, "supported_actions", ()) or ()
         if model_name and "generateContent" in supported_actions:
-            return model_name
-    raise RuntimeError("No Gemini model with generateContent support is available for this API key.")
+            available[model_name] = True
+
+    if not available:
+        raise RuntimeError("No Gemini model with generateContent support is available for this API key.")
+
+    # Prefer models from the curated stable list.
+    for preferred in _PREFERRED_GEMINI_MODELS:
+        if preferred in available:
+            return preferred
+
+    # Fall back to any model that doesn't look like a preview or experiment.
+    stable = [m for m in available if not any(kw in m.lower() for kw in ("-preview", "-exp-", "-experimental"))]
+    if stable:
+        return stable[0]
+
+    return next(iter(available))
 
 
-def refine_prompt(messy_input: str, api_key: str) -> str:
+def refine_with_ollama(contents: str, ollama_url: str, model: str) -> str:
+    """Refine a prompt using a locally running Ollama model."""
+    payload = json.dumps(
+        {
+            "model": model,
+            "system": REFINE_SYSTEM_PROMPT,
+            "prompt": contents,
+            "stream": False,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        f"{ollama_url.rstrip('/')}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read().decode())
+    except OSError as exc:
+        raise RuntimeError(
+            f"Ollama is not reachable at {ollama_url} (connection failed or timed out). "
+            "Ensure Ollama is installed and running (https://ollama.ai)."
+        ) from exc
+    text = (result.get("response") or "").strip()
+    if not text:
+        raise RuntimeError("Ollama returned an empty response.")
+    return text
+
+
+def refine_prompt(
+    messy_input: str,
+    api_key: str,
+    context: str | None = None,
+    ollama_cfg: dict | None = None,
+) -> str:
     if not messy_input.strip():
         raise ValueError("Input cannot be empty.")
     if not api_key:
@@ -51,18 +183,30 @@ def refine_prompt(messy_input: str, api_key: str) -> str:
 
     client = genai.Client(api_key=api_key)
     model_name = _select_generation_model(client)
-    response = client.models.generate_content(
-        model=model_name,
-        contents=(
-            "Restructure this into a clean, concise, structured prompt for a smart AI. "
-            "Minimize tokens without losing intent. Use short sections and bullet points when useful.\n\n"
-            f"{messy_input.strip()}"
-        ),
-    )
-    text = (getattr(response, "text", "") or "").strip()
-    if not text:
-        raise RuntimeError("Gemini returned an empty response.")
-    return text
+
+    contents = messy_input.strip()
+    if context:
+        contents = f"Recent prompts for context:\n{context}\n\nNew input to refine:\n{contents}"
+
+    try:
+        response = client.models.generate_content(
+            model=model_name,
+            config=genai.types.GenerateContentConfig(
+                system_instruction=REFINE_SYSTEM_PROMPT,
+            ),
+            contents=contents,
+        )
+        text = (getattr(response, "text", "") or "").strip()
+        if not text:
+            raise RuntimeError("Gemini returned an empty response.")
+        return text
+    except ValueError:
+        raise
+    except Exception as exc:
+        if ollama_cfg and ollama_cfg.get("enabled") == "true":
+            print(f"\n[Gemini unavailable — using local fallback] ({type(exc).__name__})", file=sys.stderr)
+            return refine_with_ollama(contents, ollama_url=ollama_cfg["url"], model=ollama_cfg["model"])
+        raise
 
 
 def copy_to_clipboard(text: str) -> None:
@@ -115,49 +259,73 @@ def paste_with_selenium(text: str, url: str, browser: str = "firefox") -> None:
         driver.quit()
 
 
-def save_refined_prompt(
+def save_to_daily_log(
     vault_path: str,
     original_input: str,
     refined_prompt: str,
     tags: Iterable[str] = (),
     now: datetime | None = None,
 ) -> Path:
+    """Append a timestamped entry to today's daily log in the Obsidian vault.
+
+    Each day's prompts accumulate in ``AI Prompts/YYYY-MM-DD.md`` instead of
+    creating one file per refinement.
+    """
     now = now or _utc_now()
     vault = Path(vault_path).expanduser().resolve()
-    notes_dir = vault / "AI Prompts" / now.strftime("%Y") / now.strftime("%m")
-    notes_dir.mkdir(parents=True, exist_ok=True)
+    log_dir = vault / "AI Prompts"
+    log_dir.mkdir(parents=True, exist_ok=True)
 
-    merged_tags = sorted({*DEFAULT_TAGS, *(t.strip() for t in tags if t.strip())})
+    log_file = log_dir / f"{now.strftime('%Y-%m-%d')}.md"
+    is_new = not log_file.exists()
 
-    previous = sorted(notes_dir.glob("*.md"), key=lambda p: p.stat().st_mtime)
-    related = previous[-1] if previous else None
+    block = (
+        f"### {now.strftime('%H:%M:%S')} UTC\n\n"
+        f"**Original:**\n{original_input.strip()}\n\n"
+        f"**Refined:**\n{refined_prompt.strip()}\n\n"
+        "---\n\n"
+    )
 
-    title_seed = " ".join(refined_prompt.split()[:8])
-    filename = f"{now.strftime('%Y%m%d-%H%M%S')}-{_slugify(title_seed)}.md"
-    note_path = notes_dir / filename
-
-    with note_path.open("w", encoding="utf-8") as handle:
-        handle.write("---\n")
-        handle.write(f"created: {now.isoformat()}\n")
-        handle.write("tags:\n")
-        for tag in merged_tags:
-            handle.write(f"  - {tag}\n")
-        handle.write("---\n\n")
-        handle.write("# Refined Prompt\n\n")
-        handle.write("## Original Input\n")
-        handle.write(f"{original_input.strip()}\n\n")
-        handle.write("## Refined Output\n")
-        handle.write(f"{refined_prompt.strip()}\n\n")
-        if related:
-            handle.write("## Related\n")
-            handle.write(f"- [[{related.stem}]]\n\n")
+    with log_file.open("a", encoding="utf-8") as handle:
+        if is_new:
+            handle.write(f"# {now.strftime('%Y-%m-%d')} Prompt Log\n\n")
+        handle.write(block)
 
     timeline = vault / "AI Prompts" / "_timeline.md"
-    timeline.parent.mkdir(parents=True, exist_ok=True)
     with timeline.open("a", encoding="utf-8") as handle:
-        handle.write(f"- {now.strftime('%Y-%m-%d %H:%M:%S')} UTC - [[{note_path.stem}]]\n")
+        handle.write(f"- {now.strftime('%Y-%m-%d %H:%M:%S')} UTC - [[{log_file.stem}]]\n")
 
-    return note_path
+    return log_file
+
+
+def _read_recent_context(vault_path: str, now: datetime, max_entries: int = 3) -> str | None:
+    """Return recent prompt entries from today's daily log for context injection.
+
+    Returns ``None`` when no log exists yet or when it contains no entries.
+    """
+    vault = Path(vault_path).expanduser().resolve()
+    today_log = vault / "AI Prompts" / f"{now.strftime('%Y-%m-%d')}.md"
+
+    if not today_log.exists():
+        return None
+
+    content = today_log.read_text(encoding="utf-8")
+    # Split so that each piece starts at a ### timestamp header.
+    parts = re.split(r"\n(?=### )", content)
+    blocks = []
+    for part in parts:
+        stripped = part.strip()
+        if not stripped.startswith("###"):
+            continue
+        # Remove trailing separator line before storing.
+        clean = re.sub(r"\n---\s*$", "", stripped).strip()
+        if clean:
+            blocks.append(clean)
+
+    if not blocks:
+        return None
+
+    return "\n\n---\n\n".join(blocks[-max_entries:])
 
 
 def generate_weekly_recap(vault_path: str, now: datetime | None = None) -> tuple[Path, int]:
@@ -165,17 +333,16 @@ def generate_weekly_recap(vault_path: str, now: datetime | None = None) -> tuple
     vault = Path(vault_path).expanduser().resolve()
     cutoff = now - timedelta(days=7)
 
-    changed: list[Path] = []
-    for note in vault.rglob("*.md"):
-        if "Weekly Recaps" in note.parts:
-            continue
-        if note.name == "_timeline.md":
-            continue
-        modified = datetime.fromtimestamp(note.stat().st_mtime, timezone.utc)
-        if modified >= cutoff:
-            changed.append(note)
-
-    changed.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    log_dir = vault / "AI Prompts"
+    daily_logs: list[Path] = []
+    if log_dir.is_dir():
+        for log_file in sorted(log_dir.glob("[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md")):
+            try:
+                log_date = datetime.strptime(log_file.stem, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if log_date >= cutoff:
+                daily_logs.append(log_file)
 
     recap_dir = vault / "Weekly Recaps"
     recap_dir.mkdir(parents=True, exist_ok=True)
@@ -184,11 +351,11 @@ def generate_weekly_recap(vault_path: str, now: datetime | None = None) -> tuple
     with recap_path.open("w", encoding="utf-8") as handle:
         handle.write(f"# Weekly Recap ({now.strftime('%G-W%V')})\n\n")
         handle.write(f"Generated: {now.isoformat()}\n\n")
-        handle.write(f"Updated notes in last 7 days: {len(changed)}\n\n")
-        for note in changed:
-            handle.write(f"- [[{note.stem}]] ({note.relative_to(vault)})\n")
+        handle.write(f"Daily prompt logs in last 7 days: {len(daily_logs)}\n\n")
+        for log in daily_logs:
+            handle.write(f"- [[{log.stem}]] ({log.relative_to(vault)})\n")
 
-    return recap_path, len(changed)
+    return recap_path, len(daily_logs)
 
 
 def _process_input(
@@ -201,8 +368,14 @@ def _process_input(
     window_name: str,
     selenium_url: str | None,
     selenium_browser: str,
+    no_context: bool = False,
+    ollama_cfg: dict | None = None,
 ) -> None:
-    refined = refine_prompt(messy_input, api_key=api_key)
+    context = None
+    if not no_context and vault_path:
+        context = _read_recent_context(vault_path, _utc_now())
+
+    refined = refine_prompt(messy_input, api_key=api_key, context=context, ollama_cfg=ollama_cfg)
     print("\nRefined Prompt:\n")
     print(refined)
 
@@ -210,7 +383,7 @@ def _process_input(
         copy_to_clipboard(refined)
         print("\n[Copied refined prompt to clipboard]")
 
-    note_path = save_refined_prompt(vault_path, messy_input, refined, tags=tags)
+    note_path = save_to_daily_log(vault_path, messy_input, refined, tags=tags)
     print(f"[Saved to Obsidian: {note_path}]")
 
     if auto_paste:
@@ -243,6 +416,11 @@ def _parse_args() -> argparse.Namespace:
     refine_parser.add_argument("--api-key", default=gemini_api_key, help="Gemini API key.")
     refine_parser.add_argument("--tags", default="", help="Comma-separated extra tags.")
     refine_parser.add_argument("--no-clipboard", action="store_true", help="Skip clipboard copy.")
+    refine_parser.add_argument(
+        "--no-context",
+        action="store_true",
+        help="Disable injection of recent prompts as context (isolated refinement).",
+    )
     refine_parser.add_argument("--auto-paste", action="store_true", help="Paste into browser input with xdotool.")
     refine_parser.add_argument(
         "--window-name",
@@ -276,13 +454,14 @@ def main() -> int:
 
     if args.command == "weekly-recap":
         recap_path, changed = generate_weekly_recap(args.vault_path)
-        print(f"Weekly recap generated: {recap_path} ({changed} updated notes)")
+        print(f"Weekly recap generated: {recap_path} ({changed} daily logs)")
         return 0
 
     if not args.api_key:
         print("Error: --api-key or GEMINI_API_KEY is required for refine.", file=sys.stderr)
         return 2
 
+    ollama_cfg = _maybe_setup_ollama()
     tags = [part.strip() for part in args.tags.split(",") if part.strip()]
 
     if args.continuous:
@@ -303,6 +482,8 @@ def main() -> int:
                 window_name=args.window_name,
                 selenium_url=args.selenium_url,
                 selenium_browser=args.selenium_browser,
+                no_context=args.no_context,
+                ollama_cfg=ollama_cfg,
             )
         return 0
 
@@ -322,6 +503,8 @@ def main() -> int:
         window_name=args.window_name,
         selenium_url=args.selenium_url,
         selenium_browser=args.selenium_browser,
+        no_context=args.no_context,
+        ollama_cfg=ollama_cfg,
     )
     return 0
 
